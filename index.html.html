@@ -251,13 +251,24 @@ textarea:focus{border-color:rgba(91,156,246,0.4);}
 
 <script>
 // ─── GOOGLE SHEETS CONFIG ────────────────────────────────────────────────────
-// Paste your Google Sheet ID here after publishing the sheet to the web.
-// Find it in the URL: docs.google.com/spreadsheets/d/e/2PACX-1vTRCTSA0DB6GagDfxQ723gmV1k0DqWptpjZ_FAMy6Z5HBaCeI58ij8IGVWUWi6vgvAGpNcgQV2XAmyM/edit
-const SHEET_ID = 'e/2PACX-1vTRCTSA0DB6GagDfxQ723gmV1k0DqWptpjZ_FAMy6Z5HBaCeI58ij8IGVWUWi6vgvAGpNcgQV2XAmyM';
-const REFRESH_INTERVAL_MS = 120000; // 2 minutes
+// Paste your Apps Script Web App URL here after setup (see instructions below)
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyBNumVVSU7RchvJ5TWsdZRBRsCmvF_i6hlAVt_gn1_Ra35DE5KApXnPpYPoYSjaduj/exec';
+
+const SHEET_TABS = [
+  { name: 'Crossroads',   gid: '1803246924' },
+  { name: 'May River',    gid: '1006647050' },
+  { name: 'M6/7',         gid: '1446986091' },
+  { name: 'Anson Road',   gid: '456077628'  },
+  { name: 'Cottage',      gid: '660182814'  },
+  { name: 'AZB',          gid: '655184058'  },
+  { name: 'CIG Phase 9B', gid: '440477916'  },
+  { name: 'CIG Phase 9C', gid: '844081161'  },
+  { name: 'MP Village',   gid: '325259578'  },
+];
+
+const REFRESH_INTERVAL_MS = 120000;
 let _refreshTimer = null;
 let _lastFetch = null;
-let _sheetConnected = false;
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let projects = [];
@@ -268,62 +279,103 @@ let _uid = 1, _mc = 0, _ic = 0;
 function newId() { return 'p' + (_uid++); }
 function newMid() { return 'm' + (Date.now()) + '_' + (_mc++); }
 
-// ─── GOOGLE SHEETS FETCH ─────────────────────────────────────────────────────
+// ─── FETCH VIA APPS SCRIPT ────────────────────────────────────────────────────
 async function fetchFromSheets() {
-  if (SHEET_ID === 'YOUR_SHEET_ID_HERE') return;
+  if (APPS_SCRIPT_URL === 'YOUR_APPS_SCRIPT_URL_HERE') {
+    setConnectionStatus('error', 'Paste your Apps Script URL — see setup banner');
+    showSetupBanner();
+    return;
+  }
   setConnectionStatus('syncing');
   try {
-    // Get spreadsheet metadata to find all sheet tab names & gids
-    const metaUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/feed/worksheets?alt=json`;
-    const metaResp = await fetch(metaUrl);
-    if (!metaResp.ok) throw new Error('Could not reach spreadsheet');
-    const metaJson = await metaResp.json();
-    const entries = metaJson.feed.entry || [];
-    const sheetTabs = entries.map(e => ({
-      title: e.title.$t,
-      gid: e.link.find(l => l.rel === 'http://schemas.google.com/spreadsheets/2006#cellsfeed')
-              ?.href.match(/gid=(\d+)/)?.[1] || '0'
-    })).filter(t => !t.title.startsWith('📋')); // skip instructions tab
+    const resp = await fetch(APPS_SCRIPT_URL, { signal: AbortSignal.timeout(30000) });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    if (!data || !Array.isArray(data.tabs)) throw new Error('Bad response from Apps Script');
 
-    // Fetch each project tab as CSV
     const newProjects = [];
-    for (const tab of sheetTabs) {
-      const csvUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${tab.gid}`;
-      const csvResp = await fetch(csvUrl);
-      if (!csvResp.ok) continue;
-      const csvText = await csvResp.text();
-      const p = parseProjectCSV(csvText, tab.title);
-      if (p) newProjects.push(p);
+    for (const tab of data.tabs) {
+      const p = parseProjectCSV(tab.csv, tab.name);
+      if (p) {
+        console.log('✓', tab.name, 'budget:', p.budget, 'milestones:', p.milestones.length, 'issues:', p.issues.length);
+        newProjects.push(p);
+      }
     }
 
     if (newProjects.length > 0) {
-      // Merge: preserve local IDs and manual edits for existing projects,
-      // update data fields from sheet
       newProjects.forEach(sheetP => {
         const existing = projects.find(p => p.name === sheetP.name);
-        if (existing) {
-          // Update data but keep local ID and any manual edits not in sheet
-          Object.assign(existing, { ...sheetP, id: existing.id });
-        } else {
-          projects.push({ ...sheetP, id: newId() });
-        }
+        if (existing) { Object.assign(existing, { ...sheetP, id: existing.id }); }
+        else { projects.push({ ...sheetP, id: newId() }); }
       });
-      // Remove projects that no longer exist in sheet
       projects = projects.filter(p => newProjects.some(sp => sp.name === p.name));
+      _lastFetch = new Date();
+      setConnectionStatus('connected');
+      render();
+    } else {
+      throw new Error('No project data parsed');
     }
-
-    _lastFetch = new Date();
-    _sheetConnected = true;
-    setConnectionStatus('connected');
-    render();
   } catch(e) {
-    console.warn('Sheets fetch error:', e);
-    setConnectionStatus('error');
+    console.error('Fetch error:', e);
+    setConnectionStatus('error', e.message);
   }
 }
 
+function setConnectionStatus(status, detail) {
+  const el = document.getElementById('connStatus');
+  if (!el) return;
+  const map = {
+    disconnected: ['#4a5568', 'Not connected'],
+    syncing:      ['#fbbf24', 'Syncing…'],
+    connected:    ['#34d399', 'Live · ' + (_lastFetch?.toLocaleTimeString()||'')+' · '+projects.length+' projects'],
+    error:        ['#f87171', detail || 'Sync error'],
+  };
+  const [dot, text] = map[status] || map.disconnected;
+  el.innerHTML = '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:'+dot+';margin-right:6px;vertical-align:middle"></span><span style="color:'+dot+'">'+text+'</span>';
+}
+
+function startAutoRefresh() {
+  if (_refreshTimer) clearInterval(_refreshTimer);
+  fetchFromSheets();
+  _refreshTimer = setInterval(fetchFromSheets, REFRESH_INTERVAL_MS);
+}
+
+function showSetupBanner() {
+  if (document.getElementById('setupBanner')) return;
+  const banner = document.createElement('div');
+  banner.id = 'setupBanner';
+  banner.style.cssText = 'background:rgba(91,156,246,0.08);border:1px solid rgba(91,156,246,0.25);border-radius:10px;padding:20px 24px;margin-bottom:20px;line-height:1.8;';
+  banner.innerHTML = `
+    <div style="font-size:11px;font-weight:800;letter-spacing:0.1em;text-transform:uppercase;color:#5b9cf6;margin-bottom:10px;">⚡ One-Time Setup — Google Apps Script</div>
+    <div style="font-size:12px;color:#4a5568;margin-bottom:14px;">The dashboard needs a relay script inside your Google Sheet to bypass browser security. Takes about 3 minutes:</div>
+    <div style="font-size:12px;color:#e8edf2;line-height:2;">
+      <b>1.</b> Open your Google Sheet → click <b>Extensions → Apps Script</b><br>
+      <b>2.</b> Delete any existing code, paste in the script from <b>apps-script.js</b> (downloaded below)<br>
+      <b>3.</b> Click <b>Deploy → New deployment</b> → Type: <b>Web app</b><br>
+      <b>4.</b> Set <b>Execute as: Me</b> &nbsp;·&nbsp; <b>Who has access: Anyone</b> → click <b>Deploy</b><br>
+      <b>5.</b> Copy the <b>Web app URL</b> it gives you<br>
+      <b>6.</b> Open this HTML file in a text editor → find <code style="color:#5b9cf6">APPS_SCRIPT_URL = 'YOUR_APPS_SCRIPT_URL_HERE'</code> → paste your URL → save
+    </div>`;
+  const main = document.getElementById('mainContent');
+  if (main) main.insertBefore(banner, main.firstChild);
+}
+
 function parseProjectCSV(csvText, tabName) {
-  const rows = csvText.split('\n').map(r => r.split(',').map(c => c.replace(/^"|"$/g,'').trim()));
+  // Robust CSV row parser — handles quoted fields containing commas
+  function parseCSVRow(line) {
+    const result = []; let cur = ''; let inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQ = !inQ; }
+      else if (ch === ',' && !inQ) { result.push(cur.trim()); cur = ''; }
+      else { cur += ch; }
+    }
+    result.push(cur.trim());
+    return result.map(c => c.replace(/^"|"$/g, '').trim());
+  }
+
+  const lines = csvText.split('\n').filter(l => l.trim());
+  const rows = lines.map(parseCSVRow);
   if (!rows.length) return null;
 
   const p = {
@@ -332,67 +384,153 @@ function parseProjectCSV(csvText, tabName) {
     milestones: [], issues: []
   };
 
+  // Your sheet layout: col A = label OR data, col B onward = value OR more data
+  // Sections are detected by col A content; within info/budget, the value
+  // is either in col B of the SAME row, or col A of the NEXT row (vertical stacking).
+  // Milestone and issue rows are fully horizontal: name, startDate, endDate, status...
+
   let section = '';
-  let msIdx = 0, issIdx = 0;
+  // For vertical label→value pairs, track what label we just saw
+  let pendingLabel = '';
+
+  const SKIP = new Set([
+    'FIELD','VALUE','NOTES','MILESTONE NAME','START DATE','END DATE',
+    'STATUS','SLIP DAYS','PREDECESSOR MILESTONE',
+    'ISSUE DESCRIPTION','OWNER','PRIORITY','LINKED MILESTONE','DATE IDENTIFIED',
+    'STATUS / RESOLUTION','PRIORITY','DESCRIPTION','TARGET DATE'
+  ]);
+
+  function cleanNum(s) { return parseFloat((s||'0').replace(/[$,\s]/g,''))||0; }
+  function cleanStr(s) { return (s||'').trim(); }
+
+  function applyInfoValue(label, value) {
+    const L = label.toUpperCase();
+    if (L.includes('PROJECT NAME') && value) p.name = value;
+    if (L.includes('PROJECT TYPE') && value) p.type = value;
+  }
+
+  function applyBudgetValue(label, value) {
+    const L = label.toUpperCase();
+    const n = cleanNum(value);
+    if (L.includes('APPROVED BUDGET') || L.includes('TOTAL APPROVED')) p.budget = n;
+    if (L.includes('SPENT TO DATE') || L.includes('TOTAL SPENT')) p.spent = n;
+    if (L.includes('COMMITTED')) p.committed = n;
+    if (L.includes('TRACK HOMEBUILDING') && value.toLowerCase() === 'yes') p.hasUnits = true;
+    if (L.includes('UNITS PLANNED')) p.unitsPlanned = parseInt(value)||0;
+    if (L.includes('UNITS CLOSED')) p.unitsClosed = parseInt(value)||0;
+    if (L.includes('UNITS IN PROGRESS')) p.unitsInProgress = parseInt(value)||0;
+  }
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
-    const first = (row[0]||'').toUpperCase().trim();
-    const val = (row[1]||'').trim();
+    const a = row[0] || '';  // col A
+    const b = row[1] || '';  // col B
+    const AU = a.toUpperCase();
 
-    // Detect sections
-    if (first.includes('PROJECT INFORMATION')) { section = 'info'; continue; }
-    if (first.includes('BUDGET')) { section = 'budget'; continue; }
-    if (first.includes('MILESTONE')) { section = 'milestones'; msIdx = 0; continue; }
-    if (first.includes('OPEN ISSUES') || first.includes('ISSUES')) { section = 'issues'; issIdx = 0; continue; }
-    if (first.includes('NEXT WEEK')) { section = ''; continue; }
+    // ── Section headers ──────────────────────────────────────────────────────
+    if (AU.includes('PROJECT INFORMATION'))               { section='info';       pendingLabel=''; continue; }
+    if (AU.includes('BUDGET & COST') || AU==='BUDGET')    { section='budget';     pendingLabel=''; continue; }
+    if (AU.includes('MILESTONE SCHEDULE'))                { section='milestones'; pendingLabel=''; continue; }
+    if (AU.includes('OPEN ISSUES') || AU.includes('ISSUES & BLOCKERS')) { section='issues'; pendingLabel=''; continue; }
+    if (AU.includes('NEXT WEEK'))                         { section='';           pendingLabel=''; continue; }
 
-    // Skip header rows
-    if (first === 'FIELD' || first === 'MILESTONE NAME' || first === 'ISSUE DESCRIPTION') continue;
-    if (first === '' && val === '') continue;
+    // ── Skip noise rows ───────────────────────────────────────────────────────
+    if (!a) { pendingLabel=''; continue; }
+    if (a.includes('↑') || a.includes('Add more rows')) continue;
+    if (a.includes('Fill in all blue')) continue;
+    if (a.includes('Last Updated')) continue;
+    if (SKIP.has(AU)) { pendingLabel=''; continue; }
 
+    // ── INFO section ──────────────────────────────────────────────────────────
     if (section === 'info') {
-      if (first.includes('PROJECT NAME') && val) p.name = val;
-      if (first.includes('PROJECT TYPE') && val) p.type = val;
+      if (b) {
+        // Label and value on same row (col A = label, col B = value)
+        applyInfoValue(a, b);
+        pendingLabel = '';
+      } else {
+        // Label only on this row — value might be on next row col A, or blank
+        // Check if it looks like a label (known field names)
+        const AU2 = AU;
+        if (AU2.includes('PROJECT NAME') || AU2.includes('PROJECT TYPE') ||
+            AU2.includes('REPORT OWNER') || AU2.includes('WEEK ENDING')) {
+          pendingLabel = a;
+        } else if (pendingLabel) {
+          // This row's col A IS the value for the previous label
+          applyInfoValue(pendingLabel, a);
+          pendingLabel = '';
+        }
+      }
+      continue;
     }
+
+    // ── BUDGET section ────────────────────────────────────────────────────────
     if (section === 'budget') {
-      const amt = parseFloat((val||'0').replace(/[$,]/g,''))||0;
-      if (first.includes('APPROVED BUDGET') || first.includes('TOTAL APPROVED')) p.budget = amt;
-      if (first.includes('SPENT')) p.spent = amt;
-      if (first.includes('COMMITTED')) p.committed = amt;
-      if (first.includes('UNITS') && val === 'yes') p.hasUnits = true;
-      if (first.includes('UNITS PLANNED')) p.unitsPlanned = parseInt(val)||0;
-      if (first.includes('UNITS CLOSED')) p.unitsClosed = parseInt(val)||0;
-      if (first.includes('UNITS IN PROGRESS')) p.unitsInProgress = parseInt(val)||0;
+      // Check for inline unit cols on same row as "Track Homebuilding"
+      if (AU.includes('TRACK HOMEBUILDING')) {
+        if (b.toLowerCase() === 'yes') p.hasUnits = true;
+        // Scan remaining cols for Units Planned / Closed / In Progress
+        for (let ci = 2; ci < row.length - 1; ci++) {
+          const lbl = (row[ci]||'').toUpperCase();
+          const val = row[ci+1]||'';
+          if (lbl.includes('PLANNED'))  p.unitsPlanned    = parseInt(val)||0;
+          if (lbl.includes('CLOSED'))   p.unitsClosed     = parseInt(val)||0;
+          if (lbl.includes('PROGRESS')) p.unitsInProgress = parseInt(val)||0;
+        }
+        pendingLabel = '';
+        continue;
+      }
+      if (b) {
+        applyBudgetValue(a, b);
+        pendingLabel = '';
+      } else {
+        const knownBudgetLabel = AU.includes('APPROVED') || AU.includes('SPENT') ||
+          AU.includes('COMMITTED') || AU.includes('PROJECTED') || AU.includes('FINAL');
+        if (knownBudgetLabel) {
+          pendingLabel = a;
+        } else if (pendingLabel) {
+          applyBudgetValue(pendingLabel, a);
+          pendingLabel = '';
+        }
+      }
+      continue;
     }
+
+    // ── MILESTONES section ────────────────────────────────────────────────────
+    // Each milestone is one row: Name | Start Date | End Date | Status | Slip Days | Predecessor
     if (section === 'milestones') {
-      const name = (row[0]||'').trim();
-      if (!name || name.includes('↑') || name.toUpperCase() === 'MILESTONE NAME') continue;
+      if (!a || a.length < 2) continue;
+      const status = (row[3]||'upcoming').toLowerCase();
+      const validStatuses = ['done','in-progress','at-risk','upcoming'];
       p.milestones.push({
         id: newMid(),
-        name,
-        startDate: (row[1]||'').trim(),
-        due: (row[2]||'').trim(),
-        status: (row[3]||'upcoming').trim().toLowerCase(),
-        slipDays: parseInt(row[4]||'0')||0,
-        dependsOn: null, // cross-sheet deps handled manually
-        _depName: (row[5]||'').trim() // store for potential matching
+        name: a,
+        startDate: cleanStr(row[1]),
+        due: cleanStr(row[2]),
+        status: validStatuses.includes(status) ? status : 'upcoming',
+        slipDays: parseInt((row[4]||'0').replace(/\D/g,''))||0,
+        dependsOn: null,
+        _depName: cleanStr(row[5])
       });
+      continue;
     }
+
+    // ── ISSUES section ────────────────────────────────────────────────────────
+    // Each issue is one row: Description | Owner | Priority | Linked Milestone | Date | Resolution
     if (section === 'issues') {
-      const text = (row[0]||'').trim();
-      if (!text || text.includes('↑') || text.toUpperCase() === 'ISSUE DESCRIPTION') continue;
+      if (!a || a.length < 2) continue;
+      const pri = (row[2]||'medium').toLowerCase();
       p.issues.push({
-        text,
-        owner: (row[1]||'').trim(),
-        priority: (row[2]||'medium').trim().toLowerCase(),
+        text: a,
+        owner: cleanStr(row[1]),
+        priority: ['high','medium','low'].includes(pri) ? pri : 'medium',
         linkedMilestone: null,
-        _linkedName: (row[3]||'').trim()
+        _linkedName: cleanStr(row[3])
       });
+      continue;
     }
   }
 
-  // Resolve named dependencies within project
+  // Resolve named milestone dependencies within this project
   p.milestones.forEach(m => {
     if (m._depName) {
       const dep = p.milestones.find(x => x.name.toLowerCase() === m._depName.toLowerCase());
@@ -409,14 +547,14 @@ function parseProjectCSV(csvText, tabName) {
   return p;
 }
 
-function setConnectionStatus(status) {
+function setConnectionStatus(status, detail) {
   const el = document.getElementById('connStatus');
   if (!el) return;
   const configs = {
-    disconnected: { dot: '#4a5568', text: 'Not connected to Google Sheets', color: '#4a5568' },
-    syncing:      { dot: '#fbbf24', text: 'Syncing from Google Sheets…', color: '#fbbf24' },
-    connected:    { dot: '#34d399', text: `Live · Last sync ${_lastFetch?.toLocaleTimeString()||''}`, color: '#34d399' },
-    error:        { dot: '#f87171', text: 'Sync error — check Sheet ID & publishing settings', color: '#f87171' },
+    disconnected: { dot:'#4a5568', text:'Not connected', color:'#4a5568' },
+    syncing:      { dot:'#fbbf24', text:`Syncing ${SHEET_TABS.length} projects…`, color:'#fbbf24' },
+    connected:    { dot:'#34d399', text:`Live · ${_lastFetch?.toLocaleTimeString()||''} · ${detail||projects.length+' projects'}`, color:'#34d399' },
+    error:        { dot:'#f87171', text:`${detail||'Sync error'}`, color:'#f87171' },
   };
   const c = configs[status] || configs.disconnected;
   el.innerHTML = `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${c.dot};margin-right:6px;vertical-align:middle"></span><span style="color:${c.color}">${c.text}</span>`;
@@ -1116,31 +1254,8 @@ function saveIssues(id){
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 function render(){renderSummary();renderTabs();renderMain();}
-
-// Start up
 render();
-if (SHEET_ID !== 'YOUR_SHEET_ID_HERE') {
-  startAutoRefresh();
-} else {
-  // Show setup banner if sheet not yet connected
-  setConnectionStatus('disconnected');
-  const main = document.getElementById('mainContent');
-  // Inject a setup prompt above the empty state
-  const banner = document.createElement('div');
-  banner.style.cssText = 'background:rgba(91,156,246,0.08);border:1px solid rgba(91,156,246,0.25);border-radius:10px;padding:18px 22px;margin-bottom:18px;';
-  banner.innerHTML = `
-    <div style="font-size:11px;font-weight:800;letter-spacing:0.1em;text-transform:uppercase;color:var(--blue);margin-bottom:8px;">Connect Google Sheets</div>
-    <div style="font-size:12px;color:var(--muted);line-height:1.7;margin-bottom:12px;">
-      To auto-populate this dashboard from your Google Sheet:<br>
-      1. Upload the <strong style="color:var(--text)">portfolio_data_sheet.xlsx</strong> to Google Sheets<br>
-      2. File → Share → <strong style="color:var(--text)">Publish to web</strong> → Entire document → CSV → Publish<br>
-      3. Copy the Sheet ID from the URL (the long string between <code style="color:var(--blue)">/d/</code> and <code style="color:var(--blue)">/edit</code>)<br>
-      4. Open this HTML file in a text editor, find <code style="color:var(--blue)">SHEET_ID = 'YOUR_SHEET_ID_HERE'</code> and replace with your ID<br>
-      5. Save and reopen — the dashboard will sync automatically every 2 minutes
-    </div>
-    <div style="font-size:11px;color:var(--muted2);">Until connected, you can still add and edit projects manually using the + button below.</div>`;
-  main.insertBefore(banner, main.firstChild);
-}
+startAutoRefresh();
 </script>
 </body>
 </html>
